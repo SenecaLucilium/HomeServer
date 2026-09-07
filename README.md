@@ -4,8 +4,10 @@
 
 Ноутбук-сервер будет сидеть и управляться по локальной сети.
 
-## Установка и подготовка Ubuntu Server 24.04 LTS
-Для первого этапа ставим минимальную серверную OC без графического интерфейса - **Ubuntu Server 24.04 LTS**
+В примерах используются подсеть `192.168.1.0/24` и адрес сервера `192.168.1.145`. Замените их на значения своей домашней сети, если они отличаются.
+
+## Установка и подготовка Ubuntu 24.04 LTS
+В этом гайде используется **Ubuntu Desktop 24.04 LTS**, настроенная для работы как headless-сервер. Ubuntu Server тоже подходит: в этом случае команды `gsettings` из раздела про крышку нужно пропустить.
 
 [Официальный образ](https://ubuntu.com/download/server)
 
@@ -28,11 +30,17 @@ sudo apt install -y openssh-server
 sudo systemctl enable --now ssh
 ```
 
-Разрешаем SSH в локальной сети:
+Разрешаем SSH только из домашней сети (при необходимости замените подсеть на свою):
 
 ```bash
-sudo ufw allow OpenSSH
+sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
 sudo ufw enable
+```
+
+Проверяем, что SSH запущен:
+
+```bash
+sudo systemctl status ssh --no-pager
 ```
 
 ### 2. Подключаемся по SSH
@@ -84,7 +92,7 @@ AllowHybridSleep=no
 AllowSuspendThenHibernate=no
 ```
 
-Также отключаем засыпание от бездействия:
+Для Ubuntu Desktop отключаем засыпание от бездействия. На Ubuntu Server это не нужно:
 
 ```bash
 gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
@@ -92,7 +100,7 @@ gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-typ
 gsettings set org.gnome.desktop.session idle-delay 300
 ```
 
-Отключаем wifi системе:
+После того как SSH по Ethernet проверен, отключаем Wi‑Fi серверу:
 
 ```bash
 sudo nmcli radio wifi off
@@ -140,11 +148,11 @@ sudo usermod -aG docker "$USER"
 
 ## Создание хранилища
 
-Samba - это сетевая папка, чтобы использовать сервер как облако и перекидывать файлы между устройствами.
+Samba — это сетевая папка для домашней сети. Это не полноценное облачное хранилище и не даёт удалённый доступ через интернет.
 
 ### Подготовка локального хранилища
 
-Нужно создать структуру папок, в которой будут хранится файлы:
+Нужно создать структуру папок, в которой будут храниться файлы:
 
 ```bash
 sudo mkdir -p /srv/homeserver/appdata
@@ -178,11 +186,17 @@ sudo apt install -y samba
 sudo nano /etc/samba/smb.conf
 ```
 
-В конец файла вставляем:
+В секцию `[global]` добавляем короткое имя Samba:
+
+```ini
+   netbios name = <NAME>
+```
+
+В конец файла вставляем ресурс:
 
 ```ini
 [storage]
-   comment = <NAME>
+   comment = <SERVER_NAME>
    path = /srv/homeserver/storage
    browseable = yes
    read only = no
@@ -217,7 +231,9 @@ sudo ufw allow from 192.168.1.0/24 to any port 445 proto tcp
 
 С других устройств подключаться к Samba можно через встроенные функции проводника. Например, на Windows 11 вставьте в адресную строку:
 
-```\\192.168.1.xxx\storage```
+```text
+\\192.168.1.xxx\storage
+```
 
 и введите логин, пароль.
 
@@ -244,6 +260,8 @@ PGID=1000
 TZ=Europe/Moscow
 ```
 
+Перед этим проверьте значения командами `id -u` и `id -g`; если они не равны `1000`, укажите фактические значения.
+
 Создаём Docker Compose-конфигурацию:
 
 ```bash
@@ -267,6 +285,14 @@ services:
     restart: unless-stopped
 ```
 
+До первого запуска создаём каталоги конфигурации и выдаём права контейнеру:
+
+```bash
+sudo mkdir -p /srv/homeserver/appdata/jellyfin/config
+sudo mkdir -p /srv/homeserver/appdata/jellyfin/cache
+sudo chown -R "$USER:$USER" /srv/homeserver/appdata/jellyfin
+```
+
 Разрешаем Jellyfin в домашней сети и запускаем его:
 
 ```bash
@@ -277,3 +303,57 @@ docker compose up -d
 
 Открываем в браузере ``http://192.168.1.145:8096`` и выполняем мастер-установку.
 После установки в Jellyfin создаем Каталоги согласно созданным медиа-папкам. Например Movies -> /media/movies и тд.
+
+## qBitTorrent
+Подготовьте папку настроек qBitTorrent:
+
+```bash
+sudo mkdir -p /srv/homeserver/appdata/qbittorrent
+sudo chown -R "$USER:$USER" /srv/homeserver/appdata/qbittorrent
+```
+
+Добавляем сервис в compose.yaml:
+```bash
+cd ~/home-server
+nano compose.yaml
+```
+Внутри блока ``services:`` добавляем:
+```yaml
+  qbittorrent:
+    image: ghcr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      PUID: "${PUID}"
+      PGID: "${PGID}"
+      TZ: "${TZ}"
+      WEBUI_PORT: "8080"
+      TORRENTING_PORT: "6881"
+    volumes:
+      - /srv/homeserver/appdata/qbittorrent:/config
+      - /srv/homeserver/storage/downloads:/downloads
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    restart: unless-stopped
+```
+
+Разрешаем WebUI только дома и запускаем:
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp
+docker compose pull qbittorrent
+docker compose up -d
+docker compose ps
+```
+
+Узнаём временный пароль WebUI:
+```bash
+docker compose logs --tail=100 qbittorrent
+```
+
+В логе нужно найти строчку о временном пароле администратора. Имя пользователя обычно ``admin``.
+Открываем с другого ноутбука `http://192.168.1.xxx:8080`, заходим и сразу меняем пароль. В настройках это Settings -> WebUI -> Authentication. Также в настройках Settings -> Downloads устанавливаем:
+```
+Default Save Path: /downloads/complete
+Keep incomplete torrents in: /downloads/incomplete
+```
